@@ -20,9 +20,13 @@ export function parseRpcUrls(customRpc?: string): string[] {
 export function getProvider(chain: ChainConfig, customRpc?: string): ethers.JsonRpcProvider {
   const parsedUrls = parseRpcUrls(customRpc);
   const url = parsedUrls.length > 0 ? parsedUrls[0] : (customRpc && customRpc.trim().length > 0 ? customRpc.trim() : chain.rpcUrl);
-  return new ethers.JsonRpcProvider(url, {
+  const req = new ethers.FetchRequest(url);
+  req.timeout = 15000;
+  return new ethers.JsonRpcProvider(req, {
     chainId: chain.id,
     name: chain.name,
+  }, {
+    staticNetwork: true,
   });
 }
 
@@ -48,10 +52,16 @@ export function getCandidateProviders(chain: ChainConfig, customRpc?: string): e
     }
   }
 
-  return urls.map(url => new ethers.JsonRpcProvider(url, {
-    chainId: chain.id,
-    name: chain.name,
-  }));
+  return urls.map(url => {
+    const req = new ethers.FetchRequest(url);
+    req.timeout = 15000;
+    return new ethers.JsonRpcProvider(req, {
+      chainId: chain.id,
+      name: chain.name,
+    }, {
+      staticNetwork: true,
+    });
+  });
 }
 
 export function formatAddress(address: string): string {
@@ -195,14 +205,29 @@ export async function fetchWalletBalance(
   return { wei: '0', formatted: '0' };
 }
 
+export interface ExecuteMintCallbacks {
+  onBroadcast?: (txHash: string) => void;
+  onConfirm?: (receipt: ethers.TransactionReceipt) => void;
+}
+
+export interface ExecuteMintOptions {
+  sharedFeeRecipient?: string;
+  sharedFeeData?: { maxPriorityFeePerGas: bigint; maxFeePerGas: bigint };
+  callbacks?: ExecuteMintCallbacks;
+}
+
 export async function determineWorkingFeeRecipient(
   seaDrop: ethers.Contract,
   contractAddress: string,
   dropData: PublicDropData,
-  walletAddress: string,
-  quantity: number,
-  totalValue: bigint
+  walletAddress?: string,
+  quantity: number = 1,
+  totalValue: bigint = 0n
 ): Promise<string> {
+  if (dropData.workingFeeRecipient) {
+    return dropData.workingFeeRecipient;
+  }
+
   const candidates: string[] = [];
 
   // 1. Prefer allowed fee recipients configured on the contract
@@ -235,7 +260,10 @@ export async function determineWorkingFeeRecipient(
   }
 
   // If there's only 1 candidate, return it
-  if (candidates.length === 1) return candidates[0];
+  if (candidates.length === 1) {
+    dropData.workingFeeRecipient = candidates[0];
+    return candidates[0];
+  }
 
   // Try each candidate with estimateGas to automatically match the allowed one
   for (const candidate of candidates) {
@@ -246,10 +274,11 @@ export async function determineWorkingFeeRecipient(
         ethers.ZeroAddress,
         quantity,
         {
-          from: walletAddress,
+          from: walletAddress || ethers.ZeroAddress,
           value: totalValue
         }
       );
+      dropData.workingFeeRecipient = candidate;
       return candidate;
     } catch (err: any) {
       const reason = parseRevertReason(err);
@@ -262,10 +291,12 @@ export async function determineWorkingFeeRecipient(
         continue;
       }
       // If error is for another condition (e.g. NotActive), feeRecipient is acceptable
+      dropData.workingFeeRecipient = candidate;
       return candidate;
     }
   }
 
+  dropData.workingFeeRecipient = candidates[0];
   return candidates[0];
 }
 
@@ -350,24 +381,27 @@ export async function executeMint(
   dropData: PublicDropData,
   gasConfig: GasConfig,
   chain: ChainConfig,
-  customRpc?: string
-): Promise<{ txHash: string; receipt: ethers.TransactionReceipt | null }> {
+  customRpc?: string,
+  options?: ExecuteMintOptions
+): Promise<{ txHash: string; receipt: ethers.TransactionReceipt | null; pendingInMempool?: boolean }> {
   try {
     const mintPriceWei = BigInt(dropData.mintPrice);
     const totalValue = mintPriceWei * BigInt(quantity);
     const minterIfNotPayer = ethers.ZeroAddress;
 
-    const queryProvider = getProvider(chain, customRpc);
-    const querySeaDrop = new ethers.Contract(chain.seaDropAddress, SEADROP_ABI, queryProvider);
-
-    const feeRecipient = await determineWorkingFeeRecipient(
-      querySeaDrop,
-      contractAddress,
-      dropData,
-      wallet.address,
-      quantity,
-      totalValue
-    );
+    let feeRecipient = options?.sharedFeeRecipient || dropData.workingFeeRecipient;
+    if (!feeRecipient) {
+      const queryProvider = getProvider(chain, customRpc);
+      const querySeaDrop = new ethers.Contract(chain.seaDropAddress, SEADROP_ABI, queryProvider);
+      feeRecipient = await determineWorkingFeeRecipient(
+        querySeaDrop,
+        contractAddress,
+        dropData,
+        wallet.address,
+        quantity,
+        totalValue
+      );
+    }
 
     if (wallet.type === 'injected') {
       // Injected provider (MetaMask, OKX, etc.)
@@ -400,7 +434,29 @@ export async function executeMint(
           value: totalValue
         }
       );
-      const receipt = await tx.wait();
+
+      // Trigger immediate broadcast notification
+      if (options?.callbacks?.onBroadcast) {
+        options.callbacks.onBroadcast(tx.hash);
+      }
+
+      // Confirmation with timeout
+      let receipt: any = null;
+      try {
+        const waitPromise = tx.wait(1);
+        const timeoutPromise = new Promise<null>((_, reject) =>
+          setTimeout(() => reject(new Error('CONFIRMATION_TIMEOUT')), 25000)
+        );
+        receipt = await Promise.race([waitPromise, timeoutPromise]);
+        if (options?.callbacks?.onConfirm && receipt) {
+          options.callbacks.onConfirm(receipt);
+        }
+      } catch (waitErr: any) {
+        if (waitErr?.message === 'CONFIRMATION_TIMEOUT') {
+          return { txHash: tx.hash, receipt: null, pendingInMempool: true };
+        }
+        throw waitErr;
+      }
       return { txHash: tx.hash, receipt };
     } else {
       // Private Key wallet execution
@@ -413,22 +469,33 @@ export async function executeMint(
       const seaDrop = new ethers.Contract(chain.seaDropAddress, SEADROP_ABI, signerWallet);
 
       // Build gas params
-      const feeData = await provider.getFeeData();
-      let maxPriorityFee = feeData.maxPriorityFeePerGas || ethers.parseUnits('1.5', 'gwei');
-      let maxFee = feeData.maxFeePerGas || (feeData.gasPrice ? feeData.gasPrice * 2n : ethers.parseUnits('20', 'gwei'));
+      const isArc = chain.id === 5042;
+      const minArcFee = ethers.parseUnits('20', 'gwei');
+
+      let maxPriorityFee: bigint;
+      let maxFee: bigint;
 
       if (gasConfig.preset === 'sniper' || gasConfig.preset === 'custom') {
         maxPriorityFee = ethers.parseUnits(gasConfig.maxPriorityFeePerGasGwei.toString(), 'gwei');
         maxFee = ethers.parseUnits(gasConfig.maxFeePerGasGwei.toString(), 'gwei');
-      } else if (gasConfig.preset === 'fast') {
-        maxPriorityFee = (maxPriorityFee * 15n) / 10n;
-        maxFee = (maxFee * 15n) / 10n;
+      } else if (options?.sharedFeeData) {
+        maxPriorityFee = options.sharedFeeData.maxPriorityFeePerGas;
+        maxFee = options.sharedFeeData.maxFeePerGas;
+      } else {
+        const feeData = await provider.getFeeData();
+        maxPriorityFee = feeData.maxPriorityFeePerGas || ethers.parseUnits('1.5', 'gwei');
+        maxFee = feeData.maxFeePerGas || (feeData.gasPrice ? feeData.gasPrice * 2n : ethers.parseUnits('20', 'gwei'));
+        if (gasConfig.preset === 'fast') {
+          maxPriorityFee = (maxPriorityFee * 15n) / 10n;
+          maxFee = (maxFee * 15n) / 10n;
+        }
+        const networkBaseFee = feeData.maxFeePerGas || feeData.gasPrice || (isArc ? minArcFee : ethers.parseUnits('0.1', 'gwei'));
+        if (maxFee < networkBaseFee) {
+          maxFee = (networkBaseFee * 13n) / 10n;
+        }
       }
 
-      // Ensure Arc Network (id: 5042) meets minimum 20 Gwei threshold (0.00000002 USDC)
-      const isArc = chain.id === 5042;
-      const minArcFee = ethers.parseUnits('20', 'gwei');
-
+      // Ensure Arc Network (id: 5042) meets minimum 20 Gwei threshold
       if (isArc) {
         if (maxPriorityFee < ethers.parseUnits('1', 'gwei')) {
           maxPriorityFee = ethers.parseUnits('1', 'gwei');
@@ -438,36 +505,38 @@ export async function executeMint(
         }
       }
 
-      // Ensure maxFee is not below network baseFee
-      const networkBaseFee = feeData.maxFeePerGas || feeData.gasPrice || (isArc ? minArcFee : ethers.parseUnits('0.1', 'gwei'));
-      if (maxFee < networkBaseFee) {
-        maxFee = (networkBaseFee * 13n) / 10n;
-      }
       if (maxPriorityFee > maxFee) {
         maxPriorityFee = maxFee / 2n;
       }
 
-      // Estimate gas limit
-      let gasLimit = 220000n;
-      try {
-        const estimated = await seaDrop.mintPublic.estimateGas(
-          contractAddress,
-          feeRecipient,
-          minterIfNotPayer,
-          quantity,
-          {
-            value: totalValue
-          }
-        );
-        gasLimit = (estimated * BigInt(Math.round(gasConfig.gasLimitMultiplier * 100))) / 100n;
-      } catch (estErr: any) {
-        const decodedEst = decodeContractError(estErr);
-        if (decodedEst.selector) {
-          throw new Error(`预检失败: ${decodedEst.reason}`);
+      // Gas limit optimization:
+      // In high-frequency sniper mode, avoid 20 parallel estimateGas roundtrips that trigger RPC rate limits.
+      // SeaDrop mintPublic on ERC721 usually uses ~110k-140k gas. 260k is plenty safe.
+      let gasLimit = 260000n;
+      if (gasConfig.preset !== 'sniper') {
+        try {
+          const estPromise = seaDrop.mintPublic.estimateGas(
+            contractAddress,
+            feeRecipient,
+            minterIfNotPayer,
+            quantity,
+            {
+              value: totalValue
+            }
+          );
+          const timeoutPromise = new Promise<bigint>((_, reject) =>
+            setTimeout(() => reject(new Error('EST_TIMEOUT')), 2000)
+          );
+          const estimated = await Promise.race([estPromise, timeoutPromise]);
+          gasLimit = (estimated * BigInt(Math.round(gasConfig.gasLimitMultiplier * 100))) / 100n;
+        } catch {
+          gasLimit = (260000n * BigInt(Math.round(gasConfig.gasLimitMultiplier * 100))) / 100n;
         }
-        gasLimit = 260000n;
+      } else {
+        gasLimit = (260000n * BigInt(Math.round(gasConfig.gasLimitMultiplier * 100))) / 100n;
       }
 
+      // Broadcast transaction
       const tx = await seaDrop.mintPublic(
         contractAddress,
         feeRecipient,
@@ -481,7 +550,29 @@ export async function executeMint(
         }
       );
 
-      const receipt = await tx.wait();
+      // Trigger immediate broadcast notification with TX hash
+      if (options?.callbacks?.onBroadcast) {
+        options.callbacks.onBroadcast(tx.hash);
+      }
+
+      // Asynchronously wait for confirmation with timeout (20s)
+      let receipt: ethers.TransactionReceipt | null = null;
+      try {
+        const waitPromise = tx.wait(1);
+        const timeoutPromise = new Promise<null>((_, reject) =>
+          setTimeout(() => reject(new Error('CONFIRMATION_TIMEOUT')), 20000)
+        );
+        receipt = await Promise.race([waitPromise, timeoutPromise]);
+        if (options?.callbacks?.onConfirm && receipt) {
+          options.callbacks.onConfirm(receipt);
+        }
+      } catch (waitErr: any) {
+        if (waitErr?.message === 'CONFIRMATION_TIMEOUT') {
+          return { txHash: tx.hash, receipt: null, pendingInMempool: true };
+        }
+        throw waitErr;
+      }
+
       return { txHash: tx.hash, receipt };
     }
   } catch (err: any) {

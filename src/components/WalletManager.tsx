@@ -346,7 +346,24 @@ export const WalletManager: React.FC<WalletManagerProps> = ({
                   {wallet.status === 'pending' && (
                     <span className="inline-flex items-center gap-1 text-[11px] text-amber-400 bg-amber-950/60 border border-amber-800/40 px-2 py-0.5 rounded">
                       <div className="w-2 h-2 border border-amber-400 border-t-transparent rounded-full animate-spin" />
-                      <span>广播中</span>
+                      <span>正在广播</span>
+                    </span>
+                  )}
+                  {wallet.status === 'submitted' && (
+                    <span className="inline-flex items-center gap-1 text-[11px] text-sky-400 bg-sky-950/60 border border-sky-800/40 px-2 py-0.5 rounded">
+                      <div className="w-2 h-2 border border-sky-400 border-t-transparent rounded-full animate-spin" />
+                      <span>已广播/打包中</span>
+                      {wallet.lastTxHash && (
+                        <a
+                          href={`${chain.explorerUrl}/tx/${wallet.lastTxHash}`}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="hover:underline ml-0.5 text-sky-300"
+                          title="查看链上交易"
+                        >
+                          <ExternalLink className="w-2.5 h-2.5 inline" />
+                        </a>
+                      )}
                     </span>
                   )}
                   {wallet.status === 'simulating' && (
@@ -362,7 +379,8 @@ export const WalletManager: React.FC<WalletManagerProps> = ({
                           href={`${chain.explorerUrl}/tx/${wallet.lastTxHash}`}
                           target="_blank"
                           rel="noreferrer"
-                          className="hover:underline"
+                          className="hover:underline ml-0.5"
+                          title="查看链上交易"
                         >
                           <ExternalLink className="w-2.5 h-2.5 inline" />
                         </a>
@@ -375,7 +393,18 @@ export const WalletManager: React.FC<WalletManagerProps> = ({
                         className="inline-flex items-center gap-1 text-[11px] text-red-400 bg-red-950/60 border border-red-800/40 px-2 py-0.5 rounded cursor-help"
                         title={wallet.errorMessage || '发生错误'}
                       >
-                        <span>校验失败</span>
+                        <span>执行失败</span>
+                        {wallet.lastTxHash && (
+                          <a
+                            href={`${chain.explorerUrl}/tx/${wallet.lastTxHash}`}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="hover:underline ml-0.5"
+                            title="查看链上交易"
+                          >
+                            <ExternalLink className="w-2.5 h-2.5 inline" />
+                          </a>
+                        )}
                       </span>
                       {wallet.errorMessage && (
                         <span className="text-[9px] text-red-400/80 max-w-[140px] truncate" title={wallet.errorMessage}>

@@ -14,7 +14,7 @@ import { TerminalLogs } from './components/TerminalLogs';
 import { DocModal } from './components/DocModal';
 import { CustomRpcModal } from './components/CustomRpcModal';
 import { NftSweepModal } from './components/NftSweepModal';
-import { SUPPORTED_CHAINS, DEMO_CONTRACTS } from './constants/chains';
+import { SUPPORTED_CHAINS, DEMO_CONTRACTS, SEADROP_ABI } from './constants/chains';
 import {
   ChainConfig,
   PublicDropData,
@@ -28,6 +28,8 @@ import {
   fetchWalletBalance,
   simulateMint,
   executeMint,
+  determineWorkingFeeRecipient,
+  getProvider,
   formatAddress,
   parseRpcUrls
 } from './utils/seadrop';
@@ -427,11 +429,54 @@ export default function App() {
     // Set all to pending
     setWallets(prev => prev.map(w => w.selected ? { ...w, status: 'pending', errorMessage: undefined } : w));
 
+    // 1. 预先解析手续费接收地址与网络费率，避免多钱包并发向 RPC 发起重复查询导致限流阻塞
+    let sharedFeeRecipient = dropData.workingFeeRecipient;
+    if (!sharedFeeRecipient) {
+      try {
+        const queryProvider = getProvider(currentChain, activeCustomRpc);
+        const querySeaDrop = new ethers.Contract(currentChain.seaDropAddress, SEADROP_ABI, queryProvider);
+        sharedFeeRecipient = await determineWorkingFeeRecipient(
+          querySeaDrop,
+          contractAddress,
+          dropData,
+          selected[0].address,
+          sniperConfig.quantityPerWallet,
+          BigInt(dropData.mintPrice) * BigInt(sniperConfig.quantityPerWallet)
+        );
+        setDropData(prev => prev ? { ...prev, workingFeeRecipient: sharedFeeRecipient } : prev);
+      } catch {
+        sharedFeeRecipient = dropData.feeRecipient || ethers.ZeroAddress;
+      }
+    }
+
+    let sharedFeeData: { maxPriorityFeePerGas: bigint; maxFeePerGas: bigint } | undefined = undefined;
+    if (gasConfig.preset !== 'sniper' && gasConfig.preset !== 'custom') {
+      try {
+        const p = getProvider(currentChain, activeCustomRpc);
+        const fd = await p.getFeeData();
+        let mp = fd.maxPriorityFeePerGas || ethers.parseUnits('1.5', 'gwei');
+        let mf = fd.maxFeePerGas || (fd.gasPrice ? fd.gasPrice * 2n : ethers.parseUnits('20', 'gwei'));
+        if (gasConfig.preset === 'fast') {
+          mp = (mp * 15n) / 10n;
+          mf = (mf * 15n) / 10n;
+        }
+        sharedFeeData = { maxPriorityFeePerGas: mp, maxFeePerGas: mf };
+      } catch {
+        // fallback inside executeMint
+      }
+    }
+
     // Parallel fire via Promise.allSettled with round-robin RPC distribution
     const results = await Promise.allSettled(
       selected.map(async (wallet, walletIndex) => {
+        // 微毫秒级错峰发射，避免本地同一个 RPC 连接池瞬时拥堵
+        if (walletIndex > 0) {
+          await new Promise(r => setTimeout(r, walletIndex * 15));
+        }
+
         const assignedRpc = rpcList.length > 0 ? rpcList[walletIndex % rpcList.length] : activeCustomRpc;
         const nodeIndex = rpcList.length > 1 ? (walletIndex % rpcList.length) + 1 : undefined;
+        const nodeTag = nodeIndex ? ` [由 RPC #${nodeIndex} 广播]` : '';
 
         const res = await executeMint(
           wallet,
@@ -440,7 +485,34 @@ export default function App() {
           dropData,
           gasConfig,
           currentChain,
-          assignedRpc
+          assignedRpc,
+          {
+            sharedFeeRecipient,
+            sharedFeeData,
+            callbacks: {
+              onBroadcast: (txHash: string) => {
+                // 收到交易哈希立即将状态更新为 submitted (已广播/打包中)，并展示实时哈希
+                setWallets(prev => prev.map(w => w.id === wallet.id ? {
+                  ...w,
+                  status: 'submitted',
+                  lastTxHash: txHash
+                } : w));
+                addLog(
+                  'sniper',
+                  `🚀 钱包 #${walletIndex + 1} (${formatAddress(wallet.address)}) 交易已广播上链！TX: ${txHash.substring(0, 10)}...${nodeTag}，等待出块...`,
+                  txHash,
+                  wallet.address
+                );
+              },
+              onConfirm: (receipt) => {
+                setWallets(prev => prev.map(w => w.id === wallet.id ? {
+                  ...w,
+                  status: 'success',
+                  lastTxHash: receipt.hash
+                } : w));
+              }
+            }
+          }
         );
 
         return { ...res, nodeIndex };
@@ -448,25 +520,41 @@ export default function App() {
     );
 
     let succCount = 0;
+    let mempoolCount = 0;
     let failCount = 0;
 
     results.forEach((res, index) => {
       const targetWallet = selected[index];
       if (res.status === 'fulfilled') {
-        succCount++;
         const txHash = res.value.txHash;
         const nodeTag = res.value.nodeIndex ? ` [由 RPC 节点 #${res.value.nodeIndex} 广播]` : '';
-        setWallets(prev => prev.map(w => w.id === targetWallet.id ? {
-          ...w,
-          status: 'success',
-          lastTxHash: txHash
-        } : w));
-        addLog(
-          'success',
-          `✅ 钱包 ${formatAddress(targetWallet.address)} 铸造成功！交易已确认${nodeTag}`,
-          txHash,
-          targetWallet.address
-        );
+        if (res.value.pendingInMempool) {
+          mempoolCount++;
+          setWallets(prev => prev.map(w => w.id === targetWallet.id ? {
+            ...w,
+            status: 'submitted',
+            lastTxHash: txHash
+          } : w));
+          addLog(
+            'warn',
+            `⏳ 钱包 ${formatAddress(targetWallet.address)} 交易已在区块链网络排队中，出块确认中（点击哈希查看进度）${nodeTag}`,
+            txHash,
+            targetWallet.address
+          );
+        } else {
+          succCount++;
+          setWallets(prev => prev.map(w => w.id === targetWallet.id ? {
+            ...w,
+            status: 'success',
+            lastTxHash: txHash
+          } : w));
+          addLog(
+            'success',
+            `✅ 钱包 ${formatAddress(targetWallet.address)} 铸造成功！交易已确认${nodeTag}`,
+            txHash,
+            targetWallet.address
+          );
+        }
       } else {
         failCount++;
         const errMsg = res.reason?.message || res.reason?.shortMessage || String(res.reason);
@@ -479,7 +567,7 @@ export default function App() {
         } : w));
         addLog(
           'error',
-          `❌ 钱包 ${formatAddress(targetWallet.address)} 铸造未通过: ${errMsg}`,
+          `❌ 钱包 ${formatAddress(targetWallet.address)} 失败: ${errMsg}`,
           failedTxHash,
           targetWallet.address
         );
@@ -489,7 +577,7 @@ export default function App() {
     setIsExecuting(false);
     addLog(
       'sniper',
-      `🏁 抢购执行完毕！成功: ${succCount} / 失败: ${failCount}。正在更新余额...`
+      `🏁 抢购执行完毕！成功已确认: ${succCount} / 排队打包中: ${mempoolCount} / 失败: ${failCount}。正在更新余额...`
     );
     handleRefreshBalances();
   };

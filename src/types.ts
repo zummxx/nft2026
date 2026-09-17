@@ -21,6 +21,7 @@ export interface PublicDropData {
   restrictFeeRecipients: boolean;
   feeRecipient: string;
   allowedFeeRecipients?: string[];
+  workingFeeRecipient?: string;
   isFetched: boolean;
   isActive: boolean;
   isUpcoming: boolean;
@@ -35,7 +36,7 @@ export interface WalletAccount {
   type: 'injected' | 'private_key' | 'generated';
   balanceWei: string;
   balanceFormatted: string;
-  status: 'idle' | 'simulating' | 'ready' | 'pending' | 'success' | 'failed';
+  status: 'idle' | 'simulating' | 'ready' | 'pending' | 'submitted' | 'success' | 'failed';
   lastTxHash?: string;
   errorMessage?: string;
   selected: boolean;
