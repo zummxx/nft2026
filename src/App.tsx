@@ -5,12 +5,9 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { Header } from './components/Header';
-import { ContractConfig } from './components/ContractConfig';
-import { WalletManager } from './components/WalletManager';
-import { SniperSettings } from './components/SniperSettings';
-import { ActionControls } from './components/ActionControls';
-import { SniperControlBar } from './components/SniperControlBar';
-import { TerminalLogs } from './components/TerminalLogs';
+import { ContractSniperColumn } from './components/ContractSniperColumn';
+import { WalletGasColumn } from './components/WalletGasColumn';
+import { LaunchTerminalColumn } from './components/LaunchTerminalColumn';
 import { DocModal } from './components/DocModal';
 import { CustomRpcModal } from './components/CustomRpcModal';
 import { NftSweepModal } from './components/NftSweepModal';
@@ -303,11 +300,19 @@ export default function App() {
       setNftSymbol(details.symbol);
       setDropData(details.dropData);
 
+      // 自动将单包张数填写为合约单钱包上限
+      if (details.dropData.maxTotalMintableByWallet > 0) {
+        setSniperConfig(prev => ({
+          ...prev,
+          quantityPerWallet: details.dropData.maxTotalMintableByWallet
+        }));
+      }
+
       const priceStr = details.dropData.mintPrice === '0'
         ? '免费 (Free Mint)'
         : `${details.dropData.mintPriceFormatted} ${currentChain.nativeSymbol}`;
       const limitStr = details.dropData.maxTotalMintableByWallet > 0
-        ? `${details.dropData.maxTotalMintableByWallet} 个`
+        ? `${details.dropData.maxTotalMintableByWallet} 份 (已自动同步单包张数)`
         : '不限制';
 
       addLog(
@@ -699,53 +704,30 @@ export default function App() {
 
       {/* Main Content Dashboard */}
       <main className="flex-1 max-w-7xl w-full mx-auto p-3 sm:p-4 md:p-6 space-y-4">
-        {/* Top Full-Width Row: 抢购控制横栏 (Sniper Controls Bar) */}
-        <SniperControlBar
-          sniperConfig={sniperConfig}
-          setSniperConfig={setSniperConfig}
-          gasConfig={gasConfig}
-          setGasConfig={setGasConfig}
-          chain={currentChain}
-          dropData={dropData}
-          selectedWalletsCount={selectedWalletsCount}
-          onSimulate={handleSimulate}
-          onStartSnipe={handleStartSnipe}
-          onCancelSnipe={handleCancelSnipe}
-          isSimulating={isSimulating}
-          isExecuting={isExecuting}
-          isCountdownActive={isCountdownActive}
-          countdownSeconds={countdownSeconds}
-        />
-
         {layoutMode === 'cockpit' ? (
-          /* Bottom 3-Column Layout: 左钱包 · 中日志 · 右合约 (Left: Wallets, Center: Logs, Right: Contract) */
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
-            {/* Left Column (4 cols): 钱包管理 */}
-            <div className="lg:col-span-4">
-              <WalletManager
+          /* 大三个排版：
+             左栏 (4列)：钱包矩阵管理 & EIP-1559 链上手续费
+             中栏 (4列)：NFT 合约解析 & 抢购模式与时间
+             右栏 (4列)：模拟校验/一键发射 & 链上实时终端日志
+          */
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-stretch">
+            {/* Column 1 (4 cols): 钱包管理 & EIP-1559 链上手续费 */}
+            <div className="lg:col-span-4 flex flex-col">
+              <WalletGasColumn
                 wallets={wallets}
                 setWallets={setWallets}
                 chain={currentChain}
                 onRefreshBalances={handleRefreshBalances}
                 isRefreshing={isRefreshingBalances}
-                maxHeightClass="max-h-[460px]"
                 onOpenSweepModal={() => setShowSweepModal(true)}
+                gasConfig={gasConfig}
+                setGasConfig={setGasConfig}
               />
             </div>
 
-            {/* Center Column (4 cols): 链上日志 & 执行终端 */}
-            <div className="lg:col-span-4">
-              <TerminalLogs
-                logs={logs}
-                onClearLogs={() => setLogs([])}
-                chain={currentChain}
-                heightClass="h-[460px]"
-              />
-            </div>
-
-            {/* Right Column (4 cols): 查询与解析合约 */}
-            <div className="lg:col-span-4">
-              <ContractConfig
+            {/* Column 2 (4 cols): 合约解析 & 抢购模式与时间 */}
+            <div className="lg:col-span-4 flex flex-col">
+              <ContractSniperColumn
                 contractAddress={contractAddress}
                 setContractAddress={setContractAddress}
                 onFetchDrop={handleFetchContract}
@@ -756,14 +738,45 @@ export default function App() {
                 chain={currentChain}
                 onApplyScheduleTime={handleApplyScheduleTime}
                 error={contractError}
-                compactMode={true}
+                sniperConfig={sniperConfig}
+                setSniperConfig={setSniperConfig}
+              />
+            </div>
+
+            {/* Column 3 (4 cols): 模拟校验、一键发射 & 链上实时终端日志 */}
+            <div className="lg:col-span-4 flex flex-col">
+              <LaunchTerminalColumn
+                chain={currentChain}
+                dropData={dropData}
+                sniperConfig={sniperConfig}
+                selectedWalletsCount={selectedWalletsCount}
+                onSimulate={handleSimulate}
+                onStartSnipe={handleStartSnipe}
+                onCancelSnipe={handleCancelSnipe}
+                isSimulating={isSimulating}
+                isExecuting={isExecuting}
+                isCountdownActive={isCountdownActive}
+                countdownSeconds={countdownSeconds}
+                logs={logs}
+                onClearLogs={() => setLogs([])}
               />
             </div>
           </div>
         ) : (
-          /* Classic Stacked View */
-          <div className="space-y-6">
-            <ContractConfig
+          /* 宽屏单栏堆叠视图 (Stacked View) */
+          <div className="space-y-4">
+            <WalletGasColumn
+              wallets={wallets}
+              setWallets={setWallets}
+              chain={currentChain}
+              onRefreshBalances={handleRefreshBalances}
+              isRefreshing={isRefreshingBalances}
+              onOpenSweepModal={() => setShowSweepModal(true)}
+              gasConfig={gasConfig}
+              setGasConfig={setGasConfig}
+            />
+
+            <ContractSniperColumn
               contractAddress={contractAddress}
               setContractAddress={setContractAddress}
               onFetchDrop={handleFetchContract}
@@ -774,30 +787,15 @@ export default function App() {
               chain={currentChain}
               onApplyScheduleTime={handleApplyScheduleTime}
               error={contractError}
-              compactMode={false}
-            />
-
-            <WalletManager
-              wallets={wallets}
-              setWallets={setWallets}
-              chain={currentChain}
-              onRefreshBalances={handleRefreshBalances}
-              isRefreshing={isRefreshingBalances}
-              onOpenSweepModal={() => setShowSweepModal(true)}
-            />
-
-            <SniperSettings
               sniperConfig={sniperConfig}
               setSniperConfig={setSniperConfig}
-              gasConfig={gasConfig}
-              setGasConfig={setGasConfig}
-              chain={currentChain}
-              dropData={dropData}
-              selectedWalletsCount={selectedWalletsCount}
-              layoutMode="stack"
             />
 
-            <ActionControls
+            <LaunchTerminalColumn
+              chain={currentChain}
+              dropData={dropData}
+              sniperConfig={sniperConfig}
+              selectedWalletsCount={selectedWalletsCount}
               onSimulate={handleSimulate}
               onStartSnipe={handleStartSnipe}
               onCancelSnipe={handleCancelSnipe}
@@ -805,16 +803,8 @@ export default function App() {
               isExecuting={isExecuting}
               isCountdownActive={isCountdownActive}
               countdownSeconds={countdownSeconds}
-              selectedWalletsCount={selectedWalletsCount}
-              dropData={dropData}
-              sniperConfig={sniperConfig}
-              chain={currentChain}
-            />
-
-            <TerminalLogs
               logs={logs}
               onClearLogs={() => setLogs([])}
-              chain={currentChain}
             />
           </div>
         )}
