@@ -457,16 +457,37 @@ export const NftSweepModal: React.FC<NftSweepModalProps> = ({
           for (const tid of idsToTransfer) {
             onAddLog('info', `钱包 [${formatAddress(item.wallet.address)}] 正在转移 Token #${tid} -> ${formatAddress(targetRecipient)}...`);
             
-            // Gas overrides
+            // Gas overrides with EIP-1559 safe assertion (maxFeePerGas >= maxPriorityFeePerGas)
             const isArc = chain.id === 5042;
-            const feeData = await provider.getFeeData();
-            let maxPriority = feeData.maxPriorityFeePerGas || ethers.parseUnits(isArc ? '10' : '0.1', 'gwei');
-            let maxFee = feeData.maxFeePerGas || (isArc ? ethers.parseUnits('30', 'gwei') : ethers.parseUnits('1', 'gwei'));
+            let feeOverrides: { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint };
+            try {
+              const feeData = await provider.getFeeData();
+              let maxPriority = feeData.maxPriorityFeePerGas ?? ethers.parseUnits(isArc ? '10' : '0.01', 'gwei');
+              let maxFee = feeData.maxFeePerGas ?? (feeData.gasPrice ? (feeData.gasPrice * 15n) / 10n : (isArc ? ethers.parseUnits('30', 'gwei') : ethers.parseUnits('1', 'gwei')));
 
-            const tx = await nftContract.transferFrom(item.wallet.address, targetRecipient, tid, {
-              maxFeePerGas: maxFee,
-              maxPriorityFeePerGas: maxPriority,
-            });
+              // 严格遵守 EIP-1559 协议约束：maxFee 必须 >= maxPriority
+              if (maxFee < maxPriority) {
+                maxFee = (maxPriority * 15n) / 10n;
+              } else if (maxPriority > maxFee) {
+                maxPriority = maxFee / 2n;
+              }
+
+              if (maxPriority <= 0n) {
+                maxPriority = ethers.parseUnits('0.001', 'gwei');
+                if (maxFee <= maxPriority) {
+                  maxFee = maxPriority * 2n;
+                }
+              }
+
+              feeOverrides = { maxFeePerGas: maxFee, maxPriorityFeePerGas: maxPriority };
+            } catch {
+              feeOverrides = {
+                maxPriorityFeePerGas: ethers.parseUnits(isArc ? '10' : '0.05', 'gwei'),
+                maxFeePerGas: ethers.parseUnits(isArc ? '30' : '0.5', 'gwei'),
+              };
+            }
+
+            const tx = await nftContract.transferFrom(item.wallet.address, targetRecipient, tid, feeOverrides);
 
             lastTxHash = tx.hash;
             onAddLog('success', `Token #${tid} 已发送广播! Hash: ${tx.hash.slice(0, 10)}...`);
@@ -489,9 +510,32 @@ export const NftSweepModal: React.FC<NftSweepModalProps> = ({
           onAddLog('info', `钱包 [${formatAddress(item.wallet.address)}] 正在归集 ERC1155 #${tid} 数量: ${transferAmount}...`);
 
           const isArc = chain.id === 5042;
-          const feeData = await provider.getFeeData();
-          let maxPriority = feeData.maxPriorityFeePerGas || ethers.parseUnits(isArc ? '10' : '0.1', 'gwei');
-          let maxFee = feeData.maxFeePerGas || (isArc ? ethers.parseUnits('30', 'gwei') : ethers.parseUnits('1', 'gwei'));
+          let feeOverrides: { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint };
+          try {
+            const feeData = await provider.getFeeData();
+            let maxPriority = feeData.maxPriorityFeePerGas ?? ethers.parseUnits(isArc ? '10' : '0.01', 'gwei');
+            let maxFee = feeData.maxFeePerGas ?? (feeData.gasPrice ? (feeData.gasPrice * 15n) / 10n : (isArc ? ethers.parseUnits('30', 'gwei') : ethers.parseUnits('1', 'gwei')));
+
+            if (maxFee < maxPriority) {
+              maxFee = (maxPriority * 15n) / 10n;
+            } else if (maxPriority > maxFee) {
+              maxPriority = maxFee / 2n;
+            }
+
+            if (maxPriority <= 0n) {
+              maxPriority = ethers.parseUnits('0.001', 'gwei');
+              if (maxFee <= maxPriority) {
+                maxFee = maxPriority * 2n;
+              }
+            }
+
+            feeOverrides = { maxFeePerGas: maxFee, maxPriorityFeePerGas: maxPriority };
+          } catch {
+            feeOverrides = {
+              maxPriorityFeePerGas: ethers.parseUnits(isArc ? '10' : '0.05', 'gwei'),
+              maxFeePerGas: ethers.parseUnits(isArc ? '30' : '0.5', 'gwei'),
+            };
+          }
 
           const tx = await nftContract.safeTransferFrom(
             item.wallet.address,
@@ -499,10 +543,7 @@ export const NftSweepModal: React.FC<NftSweepModalProps> = ({
             tid,
             transferAmount,
             '0x',
-            {
-              maxFeePerGas: maxFee,
-              maxPriorityFeePerGas: maxPriority,
-            }
+            feeOverrides
           );
 
           await tx.wait(1);

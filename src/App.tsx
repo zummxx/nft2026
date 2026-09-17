@@ -465,6 +465,9 @@ export default function App() {
           mp = (mp * 15n) / 10n;
           mf = (mf * 15n) / 10n;
         }
+        if (mf < mp) {
+          mf = (mp * 15n) / 10n;
+        }
         sharedFeeData = { maxPriorityFeePerGas: mp, maxFeePerGas: mf };
       } catch {
         // fallback inside executeMint
