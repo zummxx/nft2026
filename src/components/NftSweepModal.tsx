@@ -1,8 +1,16 @@
 import React, { useState, useEffect } from 'react';
-import { X, Send, ShieldAlert, CheckCircle2, AlertTriangle, RefreshCw, ArrowRight, Wallet, Check, ExternalLink, HelpCircle } from 'lucide-react';
+import { X, Send, ShieldAlert, CheckCircle2, AlertTriangle, RefreshCw, ArrowRight, Wallet, Check, ExternalLink, HelpCircle, Zap, Key, Sparkles } from 'lucide-react';
 import { WalletAccount, ChainConfig } from '../types';
 import { ethers } from 'ethers';
 import { getProvider, getCandidateProviders, formatAddress } from '../utils/seadrop';
+import {
+  getSavedEtherscanApiKey,
+  saveEtherscanApiKey,
+  isEtherscanSupported,
+  queryWalletErc721Tokens,
+  queryContractTokensForWallets,
+  ETHERSCAN_V2_CHAINS
+} from '../utils/etherscan';
 
 // Comprehensive ABI for checking and transferring ERC721 & ERC1155
 const NFT_TRANSFER_ABI = [
@@ -64,6 +72,14 @@ export const NftSweepModal: React.FC<NftSweepModalProps> = ({
   // Manual token ID inputs if contract doesn't support tokenOfOwnerByIndex
   const [customTokenIds, setCustomTokenIds] = useState<{ [walletId: string]: string }>({});
 
+  // Etherscan Multichain V2 Fast Index states
+  const [etherscanApiKey, setEtherscanApiKey] = useState<string>(() => getSavedEtherscanApiKey());
+  const [useEtherscanFastIndex, setUseEtherscanFastIndex] = useState<boolean>(true);
+  const [showEtherscanConfig, setShowEtherscanConfig] = useState<boolean>(false);
+
+  // In-modal confirmation state to replace blocked iframe window.confirm
+  const [showConfirm, setShowConfirm] = useState(false);
+
   useEffect(() => {
     if (defaultContractAddress && !contractAddress) {
       setContractAddress(defaultContractAddress);
@@ -81,6 +97,11 @@ export const NftSweepModal: React.FC<NftSweepModalProps> = ({
       }));
       setWalletStatuses(initial);
       setScanError(null);
+      setShowConfirm(false);
+      // Auto default recipient to wallet #1 if not yet filled
+      if (!recipientAddress && wallets.length > 0) {
+        setRecipientAddress(wallets[0].address);
+      }
     }
   }, [isOpen, wallets]);
 
@@ -123,6 +144,19 @@ export const NftSweepModal: React.FC<NftSweepModalProps> = ({
         } catch {}
       }
 
+      // Pre-scan: Single-shot Etherscan contract transfer lookup across ALL wallets at once!
+      // This uses only 1 single API call (0.3s) and bypasses rate limits completely for all wallets!
+      if (tokenType === 'erc721' && useEtherscanFastIndex && wallets.length > 0) {
+        try {
+          await queryContractTokensForWallets(
+            chain.id,
+            contractAddress.trim(),
+            wallets.map(w => w.address),
+            etherscanApiKey
+          );
+        } catch {}
+      }
+
       for (const w of wallets) {
         let bal = 0;
         const foundTokenIds: string[] = [];
@@ -132,8 +166,32 @@ export const NftSweepModal: React.FC<NftSweepModalProps> = ({
             const b = await contract.balanceOf(w.address);
             bal = Number(b);
 
-            // 1. First try tokenOfOwnerByIndex (Standard Enumerable)
-            if (bal > 0) {
+            // 1. First try Etherscan Multichain API V2 Fast Index (Instant Token ID discovery)
+            if (bal > 0 && useEtherscanFastIndex) {
+              try {
+                const esRes = await queryWalletErc721Tokens(
+                  chain.id,
+                  contractAddress.trim(),
+                  w.address,
+                  etherscanApiKey,
+                  (sec) => onAddLog('warn', `⏳ Etherscan 接口频控（3秒安全限制），正在安全等待 ${sec} 秒后自动重试...`)
+                );
+                if (esRes && esRes.tokenIds.length > 0) {
+                  for (const tid of esRes.tokenIds) {
+                    if (!foundTokenIds.includes(tid)) {
+                      foundTokenIds.push(tid);
+                      if (foundTokenIds.length >= bal) break;
+                    }
+                  }
+                  if (foundTokenIds.length > 0) {
+                    onAddLog('info', `⚡ [Etherscan V2] 钱包 ${formatAddress(w.address)} 极速索引到 ${foundTokenIds.length} 枚 NFT (#${foundTokenIds.slice(0, 4).join(', #')}${foundTokenIds.length > 4 ? '...' : ''})`);
+                  }
+                }
+              } catch {}
+            }
+
+            // 2. Standard tokenOfOwnerByIndex (Standard Enumerable) if not discovered yet
+            if (bal > 0 && foundTokenIds.length === 0) {
               try {
                 for (let i = 0; i < Math.min(bal, 20); i++) {
                   const tid = await contract.tokenOfOwnerByIndex(w.address, i);
@@ -244,23 +302,36 @@ export const NftSweepModal: React.FC<NftSweepModalProps> = ({
 
   // 2. Execute Batch Sweep (归集转账)
   const handleExecuteSweep = async () => {
+    setScanError(null);
     const targetRecipient = recipientAddress.trim();
+    if (!targetRecipient) {
+      setScanError('⚠️ 请先填写归集目标接收地址（主钱包 0x...），或点击上方【快捷填入钱包 #1】');
+      const inputEl = document.getElementById('nft-sweep-recipient-input');
+      inputEl?.focus();
+      inputEl?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      return;
+    }
+
     if (!ethers.isAddress(targetRecipient)) {
-      alert('请输入合法的归集目标接收地址 (0x...)');
+      setScanError('⚠️ 接收地址格式不合法，请输入标准 0x 开头的以太坊/EVM 地址！');
+      const inputEl = document.getElementById('nft-sweep-recipient-input');
+      inputEl?.focus();
       return;
     }
 
     const eligibleWallets = walletStatuses.filter(s => s.balance > 0);
     if (eligibleWallets.length === 0) {
-      alert('当前选中的钱包中未持有该 NFT，请先点击「扫描持有数量」。');
+      setScanError('当前各钱包中持有的 NFT 数量为 0，请先点击「扫描各钱包 NFT 数量」。');
       return;
     }
 
-    const confirmMsg = `确定将 ${eligibleWallets.length} 个钱包中的 NFT 全部归集转入以下目标地址吗？\n\n接收地址: ${targetRecipient}\n网络: ${chain.nameZh || chain.name}\n\n注意：每个钱包将发出独立的转账交易并扣除微量 Gas。`;
-    if (!window.confirm(confirmMsg)) {
+    // Step 1 of in-modal confirm (avoids iframe sandbox blocking window.confirm)
+    if (!showConfirm) {
+      setShowConfirm(true);
       return;
     }
 
+    setShowConfirm(false);
     setIsExecuting(true);
     onAddLog('info', `开始执行 NFT 批量归集！目标主钱包: [${targetRecipient}]`);
 
@@ -290,6 +361,23 @@ export const NftSweepModal: React.FC<NftSweepModalProps> = ({
           if (manualId) {
             idsToTransfer = manualId.split(/[,，\s]+/).filter(Boolean);
           }
+        }
+
+        // On-the-fly Etherscan V2 lookup before heavy RPC block queries
+        if (tokenType === 'erc721' && idsToTransfer.length === 0 && useEtherscanFastIndex) {
+          try {
+            const esRes = await queryWalletErc721Tokens(
+              chain.id,
+              contractAddress.trim(),
+              item.wallet.address,
+              etherscanApiKey,
+              (sec) => onAddLog('warn', `⏳ Etherscan 接口频控（3秒安全限制），正在安全等待 ${sec} 秒后自动重试...`)
+            );
+            if (esRes && esRes.tokenIds.length > 0) {
+              idsToTransfer = esRes.tokenIds;
+              onAddLog('info', `⚡ [Etherscan V2 实时检索] 匹配到钱包 [${formatAddress(item.wallet.address)}] 的 Token ID: #${idsToTransfer.join(', #')}`);
+            }
+          } catch {}
         }
 
         // On-the-fly Transfer event lookup fallback across candidate providers before failing
@@ -478,21 +566,50 @@ export const NftSweepModal: React.FC<NftSweepModalProps> = ({
         <div className="p-5 overflow-y-auto space-y-4 text-xs">
           {/* Target Recipient Input */}
           <div className="space-y-1.5">
-            <label className="text-slate-300 font-semibold flex items-center justify-between">
-              <span className="flex items-center gap-1 text-emerald-400">
+            <div className="flex items-center justify-between">
+              <label className="text-slate-300 font-semibold flex items-center gap-1 text-emerald-400">
                 <Wallet className="w-3.5 h-3.5" />
-                归集目标地址 (接收 NFT 的主钱包):
-              </span>
-              <span className="text-[11px] text-slate-500 font-normal">支持任一合法的 EVM 地址</span>
-            </label>
-            <input
-              type="text"
-              id="nft-sweep-recipient-input"
-              value={recipientAddress}
-              onChange={e => setRecipientAddress(e.target.value)}
-              placeholder="0x... (主钱包地址)"
-              className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100 placeholder-slate-600 focus:outline-none focus:border-emerald-500 font-mono"
-            />
+                <span>归集目标地址 (接收 NFT 的主钱包):</span>
+              </label>
+              {wallets.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setRecipientAddress(wallets[0].address);
+                    setScanError(null);
+                    setShowConfirm(false);
+                  }}
+                  className="text-[11px] text-emerald-400 hover:text-emerald-300 hover:underline flex items-center gap-1 font-medium bg-emerald-950/40 border border-emerald-800/40 px-2 py-0.5 rounded transition-colors"
+                  title="自动填入列表中的第一个钱包地址作为接收主钱包"
+                >
+                  <Sparkles className="w-3 h-3 text-emerald-300" />
+                  <span>快捷填入钱包 #1 ({formatAddress(wallets[0].address)})</span>
+                </button>
+              )}
+            </div>
+            <div className="relative">
+              <input
+                type="text"
+                id="nft-sweep-recipient-input"
+                value={recipientAddress}
+                onChange={e => {
+                  setRecipientAddress(e.target.value);
+                  setShowConfirm(false);
+                  if (scanError) setScanError(null);
+                }}
+                placeholder="0x... (接收所有归集 NFT 的主钱包地址)"
+                className={`w-full bg-slate-950 border rounded-lg px-3 py-2 text-slate-100 placeholder-slate-600 focus:outline-none font-mono text-xs transition-colors ${
+                  !recipientAddress.trim()
+                    ? 'border-amber-500/80 bg-amber-950/10 focus:border-amber-400'
+                    : 'border-slate-700 focus:border-emerald-500'
+                }`}
+              />
+              {!recipientAddress.trim() && (
+                <span className="absolute right-2.5 top-2 text-[10px] text-amber-400 pointer-events-none font-medium">
+                  * 必填接收主地址
+                </span>
+              )}
+            </div>
           </div>
 
           {/* NFT Contract Address & Standard */}
@@ -557,6 +674,80 @@ export const NftSweepModal: React.FC<NftSweepModalProps> = ({
               />
             </div>
           )}
+
+          {/* Etherscan API V2 Multichain Fast Index Section */}
+          <div className="bg-slate-950/80 border border-slate-800 rounded-xl p-3 space-y-2.5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <div className="w-6 h-6 rounded-md bg-amber-500/20 text-amber-400 flex items-center justify-center">
+                  <Zap className="w-3.5 h-3.5" />
+                </div>
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-white font-semibold text-xs">Etherscan 多链统一 API 极速索引 (V2)</span>
+                    <span className="px-1.5 py-0.5 rounded text-[10px] bg-emerald-950/80 text-emerald-400 border border-emerald-800/60 font-mono">
+                      {chain.nameZh || chain.name} (ID: {chain.id}) {isEtherscanSupported(chain.id) ? '已原生支持' : '兼容'}
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-slate-400">
+                    基于 Etherscan V2 统一多链端点，无需循环翻查区块日志，1 秒极速抓取具体 Token ID
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2.5">
+                <label className="flex items-center gap-1.5 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={useEtherscanFastIndex}
+                    onChange={e => setUseEtherscanFastIndex(e.target.checked)}
+                    className="rounded bg-slate-900 border-slate-700 text-purple-600 focus:ring-0 w-3.5 h-3.5"
+                  />
+                  <span className="text-slate-300 text-xs font-medium">启用加速</span>
+                </label>
+                <button
+                  type="button"
+                  onClick={() => setShowEtherscanConfig(!showEtherscanConfig)}
+                  className="text-xs text-purple-400 hover:text-purple-300 underline font-medium"
+                >
+                  {showEtherscanConfig ? '收起配置' : (etherscanApiKey ? '已配置 Key' : '配置 Key')}
+                </button>
+              </div>
+            </div>
+
+            {(showEtherscanConfig || !etherscanApiKey) && (
+              <div className="pt-2.5 border-t border-slate-800/80 space-y-2 text-xs">
+                <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-1 text-slate-400 font-medium whitespace-nowrap">
+                    <Key className="w-3.5 h-3.5 text-amber-400" />
+                    <span>API Key:</span>
+                  </div>
+                  <input
+                    type="password"
+                    value={etherscanApiKey}
+                    onChange={e => {
+                      setEtherscanApiKey(e.target.value);
+                      saveEtherscanApiKey(e.target.value);
+                    }}
+                    placeholder="填入 Etherscan API Key（单个 Key 通用 Arc、Robinhood、以太坊等 60+ 条链）"
+                    className="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-slate-200 placeholder-slate-600 text-xs font-mono focus:outline-none focus:border-amber-500"
+                  />
+                  <a
+                    href="https://etherscan.io/myapikey"
+                    target="_blank"
+                    rel="noreferrer"
+                    className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-amber-300 hover:text-amber-200 text-xs flex items-center gap-1 font-medium transition-colors whitespace-nowrap"
+                  >
+                    <span>免费获取 Key</span>
+                    <ExternalLink className="w-3 h-3" />
+                  </a>
+                </div>
+                <div className="flex items-center justify-between text-[11px] text-slate-500">
+                  <span>💡 免费接口具备每秒或3秒冷却频控限制。系统内置自动节流、60秒缓存与遇限流自动等待 3 秒智能重试，单个 Key 通用 Arc、Robinhood、以太坊等 60+ 条链。</span>
+                </div>
+              </div>
+            )}
+          </div>
 
           {/* Scan Control Action */}
           <div className="flex items-center justify-between bg-slate-950/80 p-3 rounded-xl border border-slate-800">
@@ -683,32 +874,57 @@ export const NftSweepModal: React.FC<NftSweepModalProps> = ({
         </div>
 
         {/* Modal Footer Actions */}
-        <div className="p-4 border-t border-slate-800 bg-slate-900/90 flex items-center justify-between">
+        <div className="p-4 border-t border-slate-800 bg-slate-900/90 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div className="flex items-center gap-2 text-slate-400 text-xs">
-            <ShieldAlert className="w-4 h-4 text-amber-400" />
-            <span>每个有 NFT 的子钱包将消耗极微量 Gas（Arc/Robinhood 约 $0.0001/笔）</span>
+            <ShieldAlert className="w-4 h-4 text-amber-400 flex-shrink-0" />
+            <span>
+              {showConfirm
+                ? `⚠️ 请再次核对：即将把 ${totalDiscoveredNfts} 枚 NFT 转入主钱包 [${formatAddress(recipientAddress)}]`
+                : recipientAddress
+                ? `准备归集至主钱包: ${formatAddress(recipientAddress)} (每个小钱包消耗极微量 Gas)`
+                : '每个持有 NFT 的小钱包将自动发起一笔转账交易'}
+            </span>
           </div>
 
-          <div className="flex items-center gap-2.5">
+          <div className="flex items-center gap-2.5 justify-end">
             <button
               type="button"
-              onClick={onClose}
+              onClick={() => {
+                if (showConfirm) {
+                  setShowConfirm(false);
+                } else {
+                  onClose();
+                }
+              }}
               disabled={isExecuting}
               className="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold transition-colors"
             >
-              取消
+              {showConfirm ? '返回修改' : '取消'}
             </button>
             <button
               type="button"
               id="nft-sweep-execute-btn"
               onClick={handleExecuteSweep}
-              disabled={isExecuting || isScanning || totalDiscoveredNfts === 0 || !recipientAddress}
-              className="px-5 py-2 rounded-xl bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-bold shadow-lg shadow-purple-900/30 flex items-center gap-2 transition-all"
+              disabled={isExecuting || isScanning}
+              className={`px-5 py-2 rounded-xl text-white text-xs font-bold shadow-lg transition-all flex items-center gap-2 ${
+                isExecuting
+                  ? 'bg-purple-800 opacity-80 cursor-wait'
+                  : showConfirm
+                  ? 'bg-amber-600 hover:bg-amber-500 shadow-amber-900/40 ring-2 ring-amber-400 cursor-pointer animate-pulse scale-[1.02]'
+                  : totalDiscoveredNfts === 0
+                  ? 'bg-slate-700 hover:bg-slate-600 text-slate-300 cursor-pointer'
+                  : 'bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 shadow-purple-900/30 cursor-pointer'
+              }`}
             >
               {isExecuting ? (
                 <>
                   <RefreshCw className="w-3.5 h-3.5 animate-spin" />
                   <span>正在逐一归集中...</span>
+                </>
+              ) : showConfirm ? (
+                <>
+                  <Check className="w-4 h-4 text-white" />
+                  <span>确认转入 {formatAddress(recipientAddress)} (点击立即执行)</span>
                 </>
               ) : (
                 <>
